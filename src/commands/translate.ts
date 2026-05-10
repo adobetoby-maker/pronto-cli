@@ -15,6 +15,10 @@ import { discoverStringsFiles, writeStringsFile, getExistingStrings } from '../l
 import { discoverAndroidFiles, writeAndroidStrings, getExistingAndroid } from '../lib/platforms/android.js'
 import { scanElixirFiles, groupByDomain, generateGettextPo, writeGettextPoFile } from '../lib/platforms/phoenix.js'
 import { discoverGoI18nFiles, writeGoI18nJson, messagesToTranslationMap, applyTranslationsToMessages } from '../lib/platforms/go-i18n.js'
+import { discoverVueFiles, getExistingVue, writeVueLocale } from '../lib/platforms/vue.js'
+import { loadFramerFile, getFramerSourceStrings, getFramerExistingTranslation, writeFramerFile } from '../lib/platforms/framer.js'
+import { getWebflowLocales, getWebflowPages, getPageStrings, pushPageTranslations, getWebflowToken } from '../lib/platforms/webflow.js'
+import { getTranslatableResources, registerTranslations, getShopifyToken, TRANSLATABLE_RESOURCE_TYPES } from '../lib/platforms/shopify.js'
 
 export function translateCommand(program: Command) {
   program
@@ -293,9 +297,182 @@ export function translateCommand(program: Command) {
         }
       }
 
+      // ── Vue / Nuxt ─────────────────────────────────────────────────
+      else if (config.platform === 'vue' || config.platform === 'nuxt') {
+        const sourceFiles = discoverVueFiles(config, cwd)
+        if (!sourceFiles.length) {
+          console.log(chalk.yellow(`No ${config.source_language}.json found in locales/ or src/locales/`))
+          console.log(chalk.dim('Create locales/en.json with your source strings, then re-run.'))
+          process.exit(1)
+        }
+
+        for (const lang of targetLangs) {
+          console.log(chalk.cyan(`\n→ ${lang}`))
+          for (const file of sourceFiles) {
+            const spinner = ora(`  locales/${lang}.json`).start()
+            const flat = flattenJson(file.strings) as Record<string, string>
+            const existing = opts.force ? null : getExistingVue(config, cwd, lang)
+            const existingFlat = existing ? flattenJson(existing) as Record<string, string> : null
+            const { changed, unchanged } = diffStrings(flat, existingFlat)
+
+            if (!Object.keys(changed).length) {
+              spinner.succeed(chalk.dim(`  locales/${lang}.json — up to date (${unchanged} strings)`)); continue
+            }
+            if (opts.dryRun) { spinner.info(`  Would translate ${Object.keys(changed).length} strings`); continue }
+            try {
+              const result = await translateBatch({ strings: changed, targetLanguage: lang, config })
+              const merged = { ...(existingFlat ?? {}), ...result.strings }
+              const path = writeVueLocale(config, cwd, lang, unflattenJson(merged) as Record<string, unknown>)
+              writtenFiles.push(path); totalWords += result.wordsProcessed; totalStrings += Object.keys(changed).length
+              spinner.succeed(`  locales/${lang}.json — ${chalk.green(Object.keys(changed).length + ' strings')}`)
+            } catch (err) { spinner.fail(`  ${String(err)}`) }
+          }
+        }
+      }
+
+      // ── Framer ─────────────────────────────────────────────────────
+      else if (config.platform === 'framer') {
+        const framerData = loadFramerFile(config, cwd)
+        if (!framerData) {
+          console.log(chalk.yellow('No translations.json found.'))
+          console.log(chalk.dim('Export it from Framer: Site Settings → Localization → Export → drop in project root'))
+          process.exit(1)
+        }
+
+        const sourceStrings = getFramerSourceStrings(framerData, config.source_language)
+        if (!Object.keys(sourceStrings).length) {
+          console.log(chalk.yellow(`No strings found for source language "${config.source_language}" in translations.json`))
+          process.exit(1)
+        }
+
+        for (const lang of targetLangs) {
+          console.log(chalk.cyan(`\n→ ${lang}`))
+          const spinner = ora(`  translations.json [${lang}]`).start()
+          const existing = opts.force ? null : getFramerExistingTranslation(framerData, lang)
+          const { changed, unchanged } = diffStrings(sourceStrings, existing)
+
+          if (!Object.keys(changed).length) {
+            spinner.succeed(chalk.dim(`  [${lang}] up to date (${unchanged} strings)`)); continue
+          }
+          if (opts.dryRun) { spinner.info(`  Would translate ${Object.keys(changed).length} strings`); continue }
+          try {
+            const result = await translateBatch({ strings: changed, targetLanguage: lang, config })
+            const merged = { ...(existing ?? {}), ...result.strings }
+            framerData[lang] = merged
+            totalWords += result.wordsProcessed; totalStrings += Object.keys(changed).length
+            spinner.succeed(`  [${lang}] — ${chalk.green(Object.keys(changed).length + ' strings')}`)
+          } catch (err) { spinner.fail(`  ${String(err)}`) }
+        }
+
+        if (totalStrings > 0 && !opts.dryRun) {
+          const path = writeFramerFile(config, cwd, framerData)
+          writtenFiles.push(path)
+          console.log(chalk.dim('\n  Upload translations.json back to Framer:'))
+          console.log(chalk.dim('  Site Settings → Localization → Import'))
+        }
+      }
+
+      // ── Webflow ────────────────────────────────────────────────────
+      else if (config.platform === 'webflow') {
+        const siteId = config.webflow_site_id
+        if (!siteId) {
+          console.log(chalk.yellow('webflow_site_id not set in pronto.config.yml'))
+          console.log(chalk.dim('Find it in Webflow: Site Settings → General → Site ID'))
+          process.exit(1)
+        }
+
+        let token: string
+        try { token = getWebflowToken(config) } catch (e) { console.log(chalk.red(String(e))); process.exit(1) }
+
+        const spinner = ora('Fetching Webflow locales...').start()
+        const locales = await getWebflowLocales(siteId, token)
+        const pages = await getWebflowPages(siteId, token)
+        spinner.succeed(`Found ${locales.length} locales, ${pages.length} pages`)
+
+        const primaryLocale = locales.find(l => l.primary)
+        if (!primaryLocale) { console.log(chalk.red('No primary locale found in Webflow')); process.exit(1) }
+
+        for (const lang of targetLangs) {
+          const targetLocale = locales.find(l => l.tag === lang || l.tag.startsWith(lang + '-'))
+          if (!targetLocale) {
+            console.log(chalk.yellow(`\n  Language "${lang}" not configured in Webflow. Add it in Site Settings → Localization.`))
+            continue
+          }
+
+          console.log(chalk.cyan(`\n→ ${lang} (locale: ${targetLocale.displayName})`))
+
+          for (const page of pages) {
+            const spinner2 = ora(`  ${page.slug}`).start()
+            try {
+              const sourceStrings = await getPageStrings(page.id, primaryLocale.cmsLocaleId, token)
+              if (!sourceStrings.length) { spinner2.succeed(chalk.dim(`  ${page.slug} — no translatable text`)); continue }
+
+              const strMap = Object.fromEntries(sourceStrings.map(s => [s.key, s.value]))
+              if (opts.dryRun) { spinner2.info(`  ${page.slug} — would translate ${sourceStrings.length} strings`); continue }
+
+              const result = await translateBatch({ strings: strMap, targetLanguage: lang, config })
+              await pushPageTranslations(page.id, targetLocale.cmsLocaleId, result.strings, token)
+
+              totalWords += result.wordsProcessed; totalStrings += sourceStrings.length
+              spinner2.succeed(`  ${page.slug} — ${chalk.green(sourceStrings.length + ' strings')} pushed to Webflow`)
+            } catch (err) { spinner2.fail(`  ${page.slug} — ${chalk.red(String(err))}`) }
+          }
+        }
+      }
+
+      // ── Shopify ────────────────────────────────────────────────────
+      else if (config.platform === 'shopify') {
+        const store = config.shopify_store
+        if (!store) {
+          console.log(chalk.yellow('shopify_store not set in pronto.config.yml'))
+          console.log(chalk.dim('Example: shopify_store: mystore.myshopify.com'))
+          process.exit(1)
+        }
+
+        let token: string
+        try { token = getShopifyToken(config) } catch (e) { console.log(chalk.red(String(e))); process.exit(1) }
+
+        for (const lang of targetLangs) {
+          console.log(chalk.cyan(`\n→ ${lang}`))
+
+          for (const resourceType of TRANSLATABLE_RESOURCE_TYPES) {
+            const spinner2 = ora(`  ${resourceType}`).start()
+            try {
+              const items = await getTranslatableResources(store, token, resourceType, lang)
+              if (!items.length) { spinner2.succeed(chalk.dim(`  ${resourceType} — nothing to translate`)); continue }
+
+              const strMap = Object.fromEntries(items.map(i => [i.digest, i.value]))
+              if (opts.dryRun) { spinner2.info(`  ${resourceType} — would translate ${items.length} strings`); continue }
+
+              const result = await translateBatch({ strings: strMap, targetLanguage: lang, config })
+
+              // Group by resourceId and push
+              const byResource = new Map<string, typeof items>()
+              for (const item of items) {
+                if (!byResource.has(item.resourceId)) byResource.set(item.resourceId, [])
+                byResource.get(item.resourceId)!.push(item)
+              }
+
+              for (const [resourceId, resourceItems] of byResource) {
+                const translations = resourceItems
+                  .filter(i => result.strings[i.digest])
+                  .map(i => ({ key: i.key, value: result.strings[i.digest], translatableContentDigest: i.digest }))
+                if (translations.length) {
+                  await registerTranslations(store, token, resourceId, lang, translations)
+                }
+              }
+
+              totalWords += result.wordsProcessed; totalStrings += items.length
+              spinner2.succeed(`  ${resourceType} — ${chalk.green(items.length + ' strings')} pushed to Shopify`)
+            } catch (err) { spinner2.fail(`  ${resourceType} — ${chalk.red(String(err))}`) }
+          }
+        }
+      }
+
       else {
         console.log(chalk.yellow(`Platform "${config.platform}" is not yet supported.`))
-        console.log(chalk.dim('Supported: react, nextjs, wordpress, flutter, ios, android, phoenix, go-i18n, webflow, shopify, framer, wix'))
+        console.log(chalk.dim('Supported: react, nextjs, vue, nuxt, wordpress, flutter, ios, android, phoenix, go-i18n, webflow, shopify, framer'))
+        console.log(chalk.dim('Coming soon: squarespace, wix'))
         process.exit(1)
       }
 

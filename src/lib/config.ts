@@ -13,9 +13,11 @@ export interface ProntoConfig {
   tone?: 'formal' | 'informal' | 'auto'
   domain?: string           // e.g. "medical", "legal", "ecommerce"
   // Platform-specific
-  wp_url?: string           // WordPress site URL
+  wp_url?: string
   webflow_site_id?: string
+  webflow_api_token?: string
   shopify_store?: string
+  shopify_api_token?: string
 }
 
 const CONFIG_FILE = 'pronto.config.yml'
